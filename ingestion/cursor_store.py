@@ -59,3 +59,15 @@ class CursorStore:
                 return  # 幂等重放：不推进也不报错
             data[source_id] = cursor
             self._write_all(data)
+
+    def reset(self, source_id: str, cursor: int) -> None:
+        """受控重置位点：只允许经人工确认、已留痕的重新同步调用。
+
+        与 commit 不同，不做连续性/回退校验——重新同步本身就可能把位点
+        向前推过丢失区间（跳过确认）或向后退到源端重建后的新起点。
+        调用方（Pipeline.resync）必须持有该源的互斥锁并已完成审计留痕。
+        """
+        with self._lock:
+            data = self._read_all()
+            data[source_id] = cursor
+            self._write_all(data)

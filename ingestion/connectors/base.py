@@ -11,7 +11,9 @@ from ingestion.models import RawRecord
 class Connector(ABC):
     """连接器契约：
 
-    - fetch(after): 返回序号严格大于 after 的原始记录，按 seq 升序、连续无空洞。
+    - fetch(after): 返回序号严格大于等于 after 的原始记录，按 seq 升序、连续无空洞。
+      若源端被重建/清库导致无法从 after 续采（实际可提供的位置与 after 对不上），
+      应抛出 SourceGapError 并带上跳过的区间，而不是静默重排或跳过。
     - 底层异常必须由实现方包装为 SourceError（脱敏），不得原样透出。
     """
 

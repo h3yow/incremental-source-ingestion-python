@@ -25,6 +25,7 @@ from ingestion.cursor_store import CursorStore
 from ingestion.models import UnifiedRecord
 from ingestion.pipeline import Pipeline
 from ingestion.sink import HttpSink, LocalSink
+from ingestion.source_state import SourceStateStore
 
 DATA_DIR = os.environ.get("INGEST_DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 LISTEN_HOST = os.environ.get("INGEST_HOST", "127.0.0.1")
@@ -78,6 +79,12 @@ class DeliverBody(BaseModel):
     payload: str
 
 
+class ResyncBody(BaseModel):
+    source_id: str
+    operator: str
+    justification: str
+
+
 def create_app(
     data_dir: str = DATA_DIR,
     *,
@@ -92,6 +99,7 @@ def create_app(
 
     cursors = CursorStore(os.path.join(data_dir, "cursors.json"))
     local_sink = LocalSink(os.path.join(data_dir, "sink.jsonl"))
+    state = SourceStateStore(os.path.join(data_dir, "source_state.json"))
     mock_records = _load_mock_records(data_dir)
     sink_lock = threading.Lock()
 
@@ -99,6 +107,14 @@ def create_app(
         if use_http_sink:
             return HttpSink(f"http://{host}:{port}/sink/deliver")
         return local_sink
+
+    # 全局唯一 Pipeline：重新同步与采集共用每源互斥锁，跨请求并发结果确定
+    pipeline = Pipeline(
+        cursors,
+        build_sink(),
+        max_workers=int(config.get("max_workers", 4)),
+        state=state,
+    )
 
     def build_connectors():
         connectors = []
@@ -150,9 +166,7 @@ def create_app(
 
     @app.post("/ingest/run")
     def run_ingestion(max_workers: int | None = None):
-        workers = max_workers or int(config.get("max_workers", 4))
-        pipeline = Pipeline(cursors, build_sink(), max_workers=workers)
-        results = pipeline.run_all(build_connectors())
+        results = pipeline.run_all(build_connectors(), max_workers=max_workers)
         return {
             "results": [
                 {
@@ -166,6 +180,33 @@ def create_app(
                 for r in results
             ]
         }
+
+    @app.get("/ingest/status")
+    def ingest_status():
+        """按数据源查状态：当前位点、健康度、最近异常、待确认跳过区间、同步留痕。"""
+        source_ids = [item["id"] for item in config["sources"]]
+        return {"sources": [pipeline.status(sid) for sid in source_ids]}
+
+    @app.post("/ingest/resync")
+    def resync(body: ResyncBody):
+        """受控重新同步：确认跳过区间永久丢失后，把该源位点推到新起点。"""
+        result = pipeline.resync(
+            body.source_id,
+            operator=body.operator,
+            justification=body.justification,
+        )
+        payload = {
+            "source_id": result.source_id,
+            "status": result.status,
+            "cursor_before": result.cursor_before,
+            "cursor_after": result.cursor_after,
+            "gap": result.gap,
+            "audit": result.audit,
+            "failure": result.failure,
+        }
+        if result.status != "ok":
+            raise HTTPException(status_code=409, detail=payload)
+        return payload
 
     @app.get("/cursors")
     def get_cursors():

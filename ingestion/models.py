@@ -56,3 +56,16 @@ class SourceRunResult:
     cursor_after: int = INITIAL_CURSOR
     outcomes: list[RecordOutcome] = field(default_factory=list)
     failure: dict | None = None
+
+
+@dataclass
+class ResyncResult:
+    """一次受控重新同步的结果。"""
+
+    source_id: str
+    status: str  # "ok" | "rejected"
+    cursor_before: int = INITIAL_CURSOR
+    cursor_after: int = INITIAL_CURSOR
+    gap: dict | None = None      # 被确认跳过的区间 {"from", "to", "resume_from"}
+    audit: dict | None = None    # 留痕：操作人/时间/依据/位点变化
+    failure: dict | None = None

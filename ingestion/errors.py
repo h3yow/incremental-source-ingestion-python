@@ -14,6 +14,10 @@ class FailureReason(str, Enum):
     CURSOR_REGRESSION = "cursor_regression"  # 位点回退，拒绝推进
     CURSOR_GAP = "cursor_gap"                # 位点不连续，拒绝推进
     SINK_ERROR = "sink_error"                # 目标端写入失败
+    SOURCE_GAP = "source_gap"                # 源端跨过一段未处理数据，对齐失败
+    RESYNC_REQUIRED = "resync_required"      # 存在待确认跳过区间，采集被拒绝
+    NO_PENDING_GAP = "no_pending_gap"        # 没有待确认区间，重新同步被拒绝
+    INVALID_CONFIRMATION = "invalid_confirmation"  # 重新同步确认信息不完整
 
 
 class IngestionError(Exception):
@@ -65,3 +69,47 @@ class SinkError(IngestionError):
     """目标端写入失败。"""
 
     reason = FailureReason.SINK_ERROR
+
+
+class SourceGapError(IngestionError):
+    """源端实际可提供的位置与本地已确认进度对不上：
+
+    源端跨过 [gap_from, gap_to) 这段未被处理的数据。本地位点不被推进，
+    该区间被记为待确认，必须经人工重新同步确认后才允许跳过。
+    resume_from 为确认后允许续采的新起点（即 gap_to）。
+    """
+
+    reason = FailureReason.SOURCE_GAP
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_id: str | None = None,
+        gap_from: int,
+        gap_to: int,
+    ) -> None:
+        super().__init__(message, source_id=source_id)
+        self.gap_from = gap_from
+        self.gap_to = gap_to
+
+    @property
+    def resume_from(self) -> int:
+        return self.gap_to
+
+    def gap_dict(self) -> dict:
+        return {"from": self.gap_from, "to": self.gap_to, "resume_from": self.resume_from}
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        d["gap"] = self.gap_dict()
+        return d
+
+
+class ResyncError(IngestionError):
+    """重新同步请求被拒绝：没有待确认区间，或确认信息（操作人/依据）不完整。"""
+
+    def __init__(self, reason: FailureReason, message: str, *, source_id: str | None = None) -> None:
+        assert reason in (FailureReason.NO_PENDING_GAP, FailureReason.INVALID_CONFIRMATION)
+        super().__init__(message, source_id=source_id)
+        self.reason = reason
