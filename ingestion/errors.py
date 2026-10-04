@@ -14,6 +14,8 @@ class FailureReason(str, Enum):
     CURSOR_REGRESSION = "cursor_regression"  # 位点回退，拒绝推进
     CURSOR_GAP = "cursor_gap"                # 位点不连续，拒绝推进
     SINK_ERROR = "sink_error"                # 目标端写入失败
+    SOURCE_MOVED = "source_moved"            # 源端跨过未处理区间/被重建，与本地进度对不上
+    RESYNC_REQUIRED = "resync_required"      # 存在待确认的跳过区间，确认前拒绝采集
 
 
 class IngestionError(Exception):
@@ -65,3 +67,52 @@ class SinkError(IngestionError):
     """目标端写入失败。"""
 
     reason = FailureReason.SINK_ERROR
+
+
+class SourceMovedError(IngestionError):
+    """源端实际能提供的位置与本地已确认进度对不上。
+
+    gap = {"from": x, "to": y} 表示源端跨过了本地尚未处理的区间 [x, y)，
+    或本地进度超出源端当前可提供的范围（源端被重建/清库）。
+    该异常触发后本次运行对该源判为异常并停止，本地位点保持不动。
+    """
+
+    reason = FailureReason.SOURCE_MOVED
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_id: str | None = None,
+        gap_from: int,
+        gap_to: int,
+    ) -> None:
+        super().__init__(message, source_id=source_id)
+        self.gap = {"from": gap_from, "to": gap_to}
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        d["gap"] = dict(self.gap)
+        return d
+
+
+class ResyncRequiredError(IngestionError):
+    """存在待人工确认的跳过区间：确认重新同步之前拒绝继续采集。"""
+
+    reason = FailureReason.RESYNC_REQUIRED
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_id: str | None = None,
+        gap: dict | None = None,
+    ) -> None:
+        super().__init__(message, source_id=source_id)
+        self.gap = dict(gap) if gap else None
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        if self.gap is not None:
+            d["gap"] = dict(self.gap)
+        return d

@@ -11,16 +11,18 @@ from ingestion.models import RawRecord
 
 class InMemoryConnector(Connector):
     def __init__(self, source_id: str, rows: list[dict[str, Any]] | None = None,
-                 fail_on_fetch: bool = False) -> None:
+                 fail_on_fetch: bool = False, start_seq: int = 0) -> None:
         self.source_id = source_id
         self.rows = rows if rows is not None else []
         self.fail_on_fetch = fail_on_fetch
+        self.start_seq = start_seq
 
     def fetch(self, after: int) -> Iterator[RawRecord]:
         if self.fail_on_fetch:
             # 模拟底层抛出任意异常，连接器必须脱敏包装
             raise RuntimeError("DB connection lost: secret-db-host:3306") from None
-        for seq, data in enumerate(self.rows):
+        for i, data in enumerate(self.rows):
+            seq = self.start_seq + i
             if seq >= after:
                 yield RawRecord(seq=seq, data=dict(data))
 

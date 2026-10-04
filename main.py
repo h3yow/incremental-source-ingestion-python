@@ -22,7 +22,8 @@ from pydantic import BaseModel
 from ingestion.connectors.file_source import FileConnector
 from ingestion.connectors.http_source import HttpConnector
 from ingestion.cursor_store import CursorStore
-from ingestion.models import UnifiedRecord
+from ingestion.errors import IngestionError
+from ingestion.models import SourceState, UnifiedRecord
 from ingestion.pipeline import Pipeline
 from ingestion.sink import HttpSink, LocalSink
 
@@ -78,6 +79,18 @@ class DeliverBody(BaseModel):
     payload: str
 
 
+class ResyncBody(BaseModel):
+    new_cursor: int
+    operator: str
+    reason: str
+    confirm: bool = False
+
+
+class RebuildBody(BaseModel):
+    start_seq: int
+    count: int = 5
+
+
 def create_app(
     data_dir: str = DATA_DIR,
     *,
@@ -112,6 +125,11 @@ def create_app(
                 raise ValueError(f"unknown source type: {item['type']}")
         return connectors
 
+    # 管线单例：每源互斥锁跨请求共享，保证"采集与重新同步并发时结果确定"
+    pipeline = Pipeline(
+        cursors, build_sink(), max_workers=int(config.get("max_workers", 4))
+    )
+
     app = FastAPI(title="incremental-source-ingestion")
 
     @app.get("/")
@@ -122,8 +140,28 @@ def create_app(
     def mock_source(source_id: str, after: int = 0, limit: int = 100):
         if source_id not in mock_records:
             raise HTTPException(status_code=503, detail="source unavailable")
-        page = [r for r in mock_records[source_id] if r["seq"] >= after][:limit]
-        return {"records": page}
+        records = mock_records[source_id]
+        page = [r for r in records if r["seq"] >= after][:limit]
+        # min_seq：源端当前最早可提供的位置，供连接器做异常对齐检测
+        min_seq = min((r["seq"] for r in records), default=None)
+        return {"records": page, "min_seq": min_seq}
+
+    @app.post("/mock/{source_id}/rebuild")
+    def mock_rebuild(source_id: str, body: RebuildBody):
+        """演示用：模拟源端被重建/换存储，数据从新的 seq 起点重新灌入。"""
+        mock_records[source_id] = [
+            {
+                "seq": body.start_seq + i,
+                "recordId": f"{source_id}-r{body.start_seq + i}",
+                "text": f"rebuilt {body.start_seq + i}",
+            }
+            for i in range(body.count)
+        ]
+        return {
+            "source_id": source_id,
+            "min_seq": body.start_seq,
+            "count": body.count,
+        }
 
     @app.post("/sink/deliver")
     def deliver(body: DeliverBody):
@@ -150,9 +188,7 @@ def create_app(
 
     @app.post("/ingest/run")
     def run_ingestion(max_workers: int | None = None):
-        workers = max_workers or int(config.get("max_workers", 4))
-        pipeline = Pipeline(cursors, build_sink(), max_workers=workers)
-        results = pipeline.run_all(build_connectors())
+        results = pipeline.run_all(build_connectors(), max_workers=max_workers)
         return {
             "results": [
                 {
@@ -166,6 +202,46 @@ def create_app(
                 for r in results
             ]
         }
+
+    @app.get("/sources/status")
+    def sources_status():
+        """按数据源查状态：当前进度、健康度、最近异常、待确认跳过区间。"""
+        states = pipeline.states.list_all()
+        source_ids = sorted(
+            {item["id"] for item in config["sources"]} | set(states)
+        )
+        return {
+            "sources": {
+                sid: {
+                    "cursor": cursors.load(sid),
+                    **states.get(sid, SourceState(sid)).to_dict(),
+                }
+                for sid in source_ids
+            }
+        }
+
+    @app.get("/sources/{source_id}/status")
+    def source_status(source_id: str):
+        return {
+            "cursor": cursors.load(source_id),
+            **pipeline.states.get(source_id).to_dict(),
+        }
+
+    @app.post("/sources/{source_id}/resync")
+    def resync_source(source_id: str, body: ResyncBody):
+        """受控重新同步：确认跳过区间永久丢失后，把该源进度推到新起点。"""
+        try:
+            return pipeline.resync(
+                source_id,
+                body.new_cursor,
+                operator=body.operator,
+                reason=body.reason,
+                confirm=body.confirm,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except IngestionError as exc:
+            raise HTTPException(status_code=409, detail=exc.to_dict()) from None
 
     @app.get("/cursors")
     def get_cursors():

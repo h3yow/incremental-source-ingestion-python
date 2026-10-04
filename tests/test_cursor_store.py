@@ -72,3 +72,19 @@ def test_sources_isolated(tmp_path):
     assert store.load("a") == 2
     assert store.load("b") == 4
     _dump(store.path)
+
+
+def test_reset_moves_forward_only(tmp_path):
+    import pytest
+    from ingestion.errors import CursorRegressionError
+
+    store = CursorStore(str(tmp_path / "cursors.json"))
+    store.commit("s1", 5, expected=0)
+    old = store.reset("s1", 100)
+    assert old == 5 and store.load("s1") == 100
+    # 回退与原地不动都拒绝
+    with pytest.raises(CursorRegressionError):
+        store.reset("s1", 50)
+    with pytest.raises(CursorRegressionError):
+        store.reset("s1", 100)
+    print("reset ok: 5 -> 100, regressions rejected")

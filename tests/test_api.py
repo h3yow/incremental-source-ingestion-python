@@ -48,8 +48,12 @@ class Server:
     def get(self, path):
         return json.loads(urllib.request.urlopen(self.base + path, timeout=10).read())
 
-    def post(self, path):
-        req = urllib.request.Request(self.base + path, data=b"{}", method="POST")
+    def post(self, path, body=None):
+        data = json.dumps(body or {}).encode()
+        req = urllib.request.Request(
+            self.base + path, data=data, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
         return json.loads(urllib.request.urlopen(req, timeout=10).read())
 
 
@@ -118,3 +122,75 @@ def test_api_restart_resumes_from_persisted_cursor(tmp_path):
           {x["source_id"]: (x["status"], x["cursor_before"], x["cursor_after"])
            for x in r["results"]})
     assert all(x["status"] == "ok" and not x["outcomes"] for x in r["results"])
+
+
+def test_api_source_moved_resync_flow(tmp_path):
+    """端到端：源端重建 -> 跨段判异常 -> 状态可查 -> 未确认拒绝 -> 确认后恢复。"""
+    with Server(tmp_path) as srv:
+        r1 = srv.post("/ingest/run")
+        assert all(r["status"] == "ok" for r in r1["results"])
+
+        # 源端被重建：events 数据换存储，seq 从 100 重新开始
+        srv.post("/mock/events/rebuild", {"start_seq": 100, "count": 3})
+
+        r2 = srv.post("/ingest/run")
+        results2 = {r["source_id"]: r for r in r2["results"]}
+        print("run after rebuild:",
+              {k: (v["status"], v["failure"]) for k, v in results2.items()})
+        # events 源判异常并给出跳过区间；orders 源不受影响
+        assert results2["events"]["status"] == "failed"
+        assert results2["events"]["failure"]["reason"] == "source_moved"
+        assert results2["events"]["failure"]["gap"] == {"from": 5, "to": 100}
+        assert results2["orders"]["status"] == "ok"
+
+        # 按源查状态：进度、健康度、最近异常、待确认区间
+        st = srv.get("/sources/events/status")
+        print("events status:", json.dumps(st, ensure_ascii=False))
+        assert st["cursor"] == 5 and st["healthy"] is False
+        assert st["status"] == "pending_resync"
+        assert st["pending_skip"]["from"] == 5 and st["pending_skip"]["to"] == 100
+        all_st = srv.get("/sources/status")["sources"]
+        assert all_st["orders"]["healthy"] is True
+
+        # 未确认前再次触发：拒绝往下走
+        r3 = srv.post("/ingest/run")
+        events3 = {r["source_id"]: r for r in r3["results"]}["events"]
+        assert events3["failure"]["reason"] == "resync_required"
+
+        # 未显式确认的 resync 请求被拒绝
+        try:
+            srv.post("/sources/events/resync",
+                     {"new_cursor": 100, "operator": "op", "reason": "x"})
+            assert False, "expected 400"
+        except urllib.error.HTTPError as e:
+            print("unconfirmed resync ->", e.code)
+            assert e.code == 400
+
+        # 显式确认后重新同步：位点推到新起点，留痕可查
+        out = srv.post("/sources/events/resync", {
+            "new_cursor": 100, "operator": "op-zhang",
+            "reason": "vendor confirmed seq 5-99 permanently lost",
+            "confirm": True,
+        })
+        print("resync:", out)
+        assert out["cursor_before"] == 5 and out["cursor_after"] == 100
+        st2 = srv.get("/sources/events/status")
+        assert st2["healthy"] is True and st2["pending_skip"] is None
+        audit = st2["resync_history"][-1]
+        assert audit["operator"] == "op-zhang"
+        assert audit["skipped_from"] == 5 and audit["skipped_to"] == 100
+
+        # 恢复采集：只采新起点的 3 条，已投递记录不重复
+        r4 = srv.post("/ingest/run")
+        results4 = {r["source_id"]: r for r in r4["results"]}
+        print("run after resync:",
+              {k: (v["status"], v["cursor_before"], v["cursor_after"],
+                   [(o["seq"], o["status"]) for o in v["outcomes"]])
+               for k, v in results4.items()})
+        assert results4["events"]["status"] == "ok"
+        assert results4["events"]["cursor_before"] == 100
+        assert results4["events"]["cursor_after"] == 103
+        sink = srv.get("/sink/records")
+        keys = [r["dedup_key"] for r in sink["records"]]
+        # 5 orders + 5 旧 events + 3 新 events，无重复
+        assert sink["count"] == 13 and len(keys) == len(set(keys))

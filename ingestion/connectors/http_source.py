@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any, Iterator
 
 from ingestion.connectors.base import Connector
-from ingestion.errors import SourceError
+from ingestion.errors import SourceError, SourceMovedError
 from ingestion.models import RawRecord
 
 PAGE_SIZE = 100
@@ -27,7 +27,7 @@ class HttpConnector(Connector):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def _get_page(self, after: int) -> list[dict[str, Any]]:
+    def _get_page(self, after: int) -> tuple[list[dict[str, Any]], int | None]:
         url = f"{self.base_url}/records?after={after}&limit={PAGE_SIZE}"
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:
@@ -39,12 +39,27 @@ class HttpConnector(Connector):
         records = body.get("records")
         if not isinstance(records, list):
             raise SourceError("malformed source response", source_id=self.source_id)
-        return records
+        min_seq = body.get("min_seq")  # 源端声明的当前最早可提供位置（可选）
+        if min_seq is not None and not isinstance(min_seq, int):
+            raise SourceError("malformed source response", source_id=self.source_id)
+        return records, min_seq
 
     def fetch(self, after: int) -> Iterator[RawRecord]:
         cursor = after
+        first_page = True
         while True:
-            page = self._get_page(cursor)
+            page, min_seq = self._get_page(cursor)
+            if first_page and min_seq is not None and min_seq > after:
+                # 源端最早可提供位置已越过本地进度：中间一段从未被采集，
+                # 判异常并停下，绝不把本地进度直接认到源端新起点。
+                raise SourceMovedError(
+                    "source skipped unprocessed range "
+                    f"[{after}, {min_seq})",
+                    source_id=self.source_id,
+                    gap_from=after,
+                    gap_to=min_seq,
+                )
+            first_page = False
             if not page:
                 return
             for item in page:

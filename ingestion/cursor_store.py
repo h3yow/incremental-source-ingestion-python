@@ -59,3 +59,21 @@ class CursorStore:
                 return  # 幂等重放：不推进也不报错
             data[source_id] = cursor
             self._write_all(data)
+
+    def reset(self, source_id: str, cursor: int) -> int:
+        """受控重新同步专用：把位点强制推进到新起点，返回原位点。
+
+        只允许向前（cursor > stored），拒绝回退；调用方（resync 流程）
+        负责在调用前完成人工确认与审计留痕。正常采集路径不得使用。
+        """
+        with self._lock:
+            data = self._read_all()
+            stored = data.get(source_id, INITIAL_CURSOR)
+            if cursor <= stored:
+                raise CursorRegressionError(
+                    f"resync reset must move forward: new={cursor} <= stored={stored}",
+                    source_id=source_id,
+                )
+            data[source_id] = cursor
+            self._write_all(data)
+            return stored
